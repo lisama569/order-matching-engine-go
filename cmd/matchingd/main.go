@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/lisama569/order-matching-engine-go/internal/checkpoint"
 	"github.com/lisama569/order-matching-engine-go/internal/domain"
 	"github.com/lisama569/order-matching-engine-go/internal/engine"
 	"github.com/lisama569/order-matching-engine-go/internal/event"
@@ -77,4 +78,53 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("重放结果与实时状态一致 ✔")
+
+	fmt.Println("== 6) 盘口快照（非阻塞查询）==")
+	depth := e.Depth()
+	fmt.Printf("   快照 seq=%d BTCUSD 买盘=%v 卖盘=%v\n", depth.Seq, depth.Books["BTCUSD"].Bids, depth.Books["BTCUSD"].Asks)
+
+	fmt.Println("== 7) 账实一致性审计 ==")
+	rep := e.Audit()
+	fmt.Printf("   审计结论: pass=%t lastSeq=%d checkedEvents=%d findings=%d\n",
+		rep.Pass, rep.LastSeq, rep.CheckedEvents, len(rep.Findings))
+	if !rep.Pass {
+		os.Exit(1)
+	}
+
+	fmt.Println("== 8) 检查点 + 增量重建 ==")
+	dir, _ := os.MkdirTemp("", "matchingd-cp")
+	defer os.RemoveAll(dir)
+	fs := checkpoint.FileStore{Dir: dir}
+	cp, err := e.SaveCheckpoint(fs)
+	if err != nil {
+		fmt.Println("save checkpoint:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("   检查点已落盘: %s/cp-%d.json (事件哈希=%d)\n", dir, cp.Seq, cp.EventHash)
+	// 再制造一些事件，然后基于检查点 + 增量段重建
+	e.Submit(engine.SubmitRequest{OrderID: "s5", AccountID: "alice", Symbol: "BTCUSD",
+		Side: domain.SideSell, Type: domain.OrderLimit, Price: 101, Quantity: 4})
+	e.Submit(engine.SubmitRequest{OrderID: "m3", AccountID: "bob", Symbol: "BTCUSD",
+		Side: domain.SideBuy, Type: domain.OrderMarket, Quantity: 2})
+	loaded, err := engine.LoadLatestCheckpoint(fs)
+	if err != nil {
+		fmt.Println("load checkpoint:", err)
+		os.Exit(1)
+	}
+	inc := engine.New([]string{"BTCUSD"}, cfg, map[string]int64{"BTCUSD": 100}, accounts)
+	res, err := inc.Rebuild(loaded, e.Events().From(loaded.Seq+1))
+	if err != nil {
+		fmt.Println("rebuild:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("   增量重建: 从 seq=%d 续放 %d 条事件 (usedCheckpoint=%t)\n",
+		res.FromSeq, res.ReplayedEvents, res.UsedCheckpoint)
+	is := inc.Snapshot()
+	cur := e.Snapshot()
+	if is.LastSeq != cur.LastSeq || fmt.Sprintf("%v", is.Books) != fmt.Sprintf("%v", cur.Books) ||
+		fmt.Sprintf("%v", is.Accounts) != fmt.Sprintf("%v", cur.Accounts) {
+		fmt.Println("INCREMENTAL REBUILD MISMATCH")
+		os.Exit(1)
+	}
+	fmt.Println("增量重建结果与实时状态一致 ✔")
 }

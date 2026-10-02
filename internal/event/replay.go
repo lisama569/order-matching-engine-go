@@ -6,8 +6,14 @@ import "fmt"
 // 校验规则：必须以序号 1 开始，且每个事件序号恰为前一个 +1。
 // 重复 => DUPLICATE；回退 => OUT_OF_ORDER；跳跃 => GAP；任一违规立即终止，不继续推进。
 func Replay(events []Event, apply func(Event) error) error {
+	return ReplayFrom(events, 1, apply)
+}
+
+// ReplayFrom 与 Replay 相同，但期望第一个事件序号为 startSeq（检查点增量重建用：
+// 从检查点覆盖的序号之后继续按顺序处理剩余事件，连续性判定与全量重放完全一致）。
+func ReplayFrom(events []Event, startSeq int64, apply func(Event) error) error {
 	seen := make(map[int64]struct{}, len(events))
-	var expected int64 = 1
+	expected := startSeq
 	for _, e := range events {
 		var kind string
 		switch {

@@ -4,7 +4,11 @@
 // 因此重建后的账户敞口与实时状态严格一致。零值限额表示该检查项关闭。
 package risk
 
-import "github.com/lisama569/order-matching-engine-go/internal/domain"
+import (
+	"sort"
+
+	"github.com/lisama569/order-matching-engine-go/internal/domain"
+)
 
 // Limits 是单账户风控限额配置（零值表示不限制）。
 type Limits struct {
@@ -208,6 +212,15 @@ func (m *Manager) OnFill(accountID, symbol string, side domain.Side, price, qty 
 	}
 }
 
+// OnRestingClosed 记录一笔挂单被完全成交而移出簿子：释放其挂单笔数占用。
+// （名义占用由 OnFill 随每笔成交释放，这里只收尾笔数。）
+func (m *Manager) OnRestingClosed(accountID, symbol string) {
+	st := m.state(acctKey{accountID, symbol})
+	if st.OpenCount > 0 {
+		st.OpenCount--
+	}
+}
+
 // OnCancelled 释放撤单的挂单占用。
 func (m *Manager) OnCancelled(accountID, symbol string, side domain.Side, price, remainingQty int64) {
 	st := m.state(acctKey{accountID, symbol})
@@ -230,4 +243,35 @@ func (m *Manager) OnCancelled(accountID, symbol string, side domain.Side, price,
 // State 返回账户-品种风控状态副本（可解释用）。
 func (m *Manager) State(accountID, symbol string) AccountState {
 	return *m.state(acctKey{accountID, symbol})
+}
+
+// AccountEntry 是一个账户-品种的风控状态条目（检查点导出/导入用）。
+type AccountEntry struct {
+	AccountID string
+	Symbol    string
+	State     AccountState
+}
+
+// ExportStates 导出全部账户风控状态（确定性排序：先账户后品种）。
+func (m *Manager) ExportStates() []AccountEntry {
+	out := make([]AccountEntry, 0, len(m.states))
+	for k, st := range m.states {
+		out = append(out, AccountEntry{AccountID: k.account, Symbol: k.symbol, State: *st})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AccountID != out[j].AccountID {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Symbol < out[j].Symbol
+	})
+	return out
+}
+
+// ImportStates 以检查点中的账户状态整体替换当前状态（增量重建用）。
+func (m *Manager) ImportStates(entries []AccountEntry) {
+	m.states = make(map[acctKey]*AccountState, len(entries))
+	for _, e := range entries {
+		st := e.State
+		m.states[acctKey{e.AccountID, e.Symbol}] = &st
+	}
 }

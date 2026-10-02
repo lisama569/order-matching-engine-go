@@ -63,13 +63,28 @@ func AsSequenceError(err error) (*SequenceError, bool) {
 }
 
 // Store 是线程安全的追加式事件日志，是全部状态变更的权威来源。
+//
+// 支持检查点基线：base > 0 时，序号 1..base 的事件已由某个检查点覆盖而不再持有，
+// 日志只保存 base 之后的事件；滚动哈希 hash 仍然覆盖全部已追加事件（含基线之前），
+// 因此可以从检查点继续追加且哈希与完整日志逐位一致。
 type Store struct {
+	base   int64  // 检查点覆盖的最大序号（0 表示完整日志）
+	hash   uint64 // 覆盖 1..LastSeq() 全部事件的滚动哈希
 	events []Event
 }
 
 // NewStore 创建空事件日志。
 func NewStore() *Store {
-	return &Store{}
+	return &Store{hash: offsetBasis64}
+}
+
+// NewStoreAt 创建带检查点基线的事件日志：下一个期望序号为 base+1，
+// 滚动哈希从 baseHash（即序号 1..base 的事件哈希）继续累积。
+func NewStoreAt(base int64, baseHash uint64) *Store {
+	if base < 0 {
+		base = 0
+	}
+	return &Store{base: base, hash: baseHash}
 }
 
 // Append 校验序号并追加事件：
@@ -77,18 +92,20 @@ func NewStore() *Store {
 //   - 小于等于已存在序号 => DUPLICATE；
 //   - 大于期望序号 => GAP。
 func (s *Store) Append(e Event) error {
-	expected := int64(len(s.events)) + 1
-	if e.Seq <= int64(len(s.events)) {
+	expected := s.LastSeq() + 1
+	if e.Seq <= s.LastSeq() {
 		return &SequenceError{Kind: SeqDuplicate, Got: e.Seq, Expected: expected}
 	}
 	if e.Seq > expected {
 		return &SequenceError{Kind: SeqGap, Got: e.Seq, Expected: expected}
 	}
 	s.events = append(s.events, e)
+	s.hash = hashEvent(s.hash, e)
 	return nil
 }
 
-// All 按序号返回全部事件副本（切片拷贝，避免外部修改）。
+// All 按序号返回当前持有的全部事件副本（切片拷贝，避免外部修改）。
+// 带基线时只含基线之后的事件。
 func (s *Store) All() []Event {
 	out := make([]Event, len(s.events))
 	copy(out, s.events)
@@ -97,16 +114,24 @@ func (s *Store) All() []Event {
 
 // From 返回序号 >= fromSeq 的事件副本（订阅者断线追赶用）。
 func (s *Store) From(fromSeq int64) []Event {
-	if fromSeq < 1 {
-		fromSeq = 1
+	if fromSeq < s.base+1 {
+		fromSeq = s.base + 1
 	}
-	if fromSeq > int64(len(s.events)) {
+	if fromSeq > s.LastSeq() {
 		return nil
 	}
-	out := make([]Event, int64(len(s.events))-fromSeq+1)
-	copy(out, s.events[fromSeq-1:])
+	start := fromSeq - s.base - 1
+	out := make([]Event, s.LastSeq()-fromSeq+1)
+	copy(out, s.events[start:])
 	return out
 }
 
-// LastSeq 返回当前最大序号（空日志为 0）。
-func (s *Store) LastSeq() int64 { return int64(len(s.events)) }
+// LastSeq 返回当前最大序号（空日志且基线为 0 时为 0）。
+func (s *Store) LastSeq() int64 { return s.base + int64(len(s.events)) }
+
+// Base 返回检查点基线序号（0 表示完整日志）。
+func (s *Store) Base() int64 { return s.base }
+
+// Hash 返回覆盖序号 1..LastSeq() 全部事件的滚动哈希。
+// 同一事件流无论从零累积还是从检查点基线继续累积，结果逐位一致。
+func (s *Store) Hash() uint64 { return s.hash }

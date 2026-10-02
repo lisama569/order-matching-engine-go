@@ -227,6 +227,36 @@ func (b *Book) ApplyFill(pf ProjectedFill, qty int64) bool {
 	return closed
 }
 
+// SettleFill 吃单方成交回写：限价吃单方在受理时已整单入簿，
+// 其每笔成交必须同步扣减所在档位总量；剩余量降为 0 时移出簿子。
+// 返回 (该委托是否在簿, 是否因本次成交被移出)。不在簿（市价吃单方）时返回 (false, false)。
+// 注意：委托的 FilledQty 由调用方（引擎状态转移）先行累加，本函数只维护档位结构。
+func (b *Book) SettleFill(orderID string, qty int64) (resting bool, closed bool) {
+	where, ok := b.index[orderID]
+	if !ok {
+		return false, false
+	}
+	lv := b.levelAt(where.side, where.price, false)
+	if lv == nil {
+		return false, false
+	}
+	lv.totalQty -= qty
+	for i, o := range lv.orders {
+		if o.ID == orderID {
+			if o.Remaining() == 0 {
+				lv.orders = append(lv.orders[:i], lv.orders[i+1:]...)
+				delete(b.index, orderID)
+				closed = true
+			}
+			break
+		}
+	}
+	if len(lv.orders) == 0 {
+		b.dropLevel(where.side, where.price)
+	}
+	return true, closed
+}
+
 // BestBid / BestAsk 返回最优价；无档位返回 (0,false)。
 func (b *Book) BestBid() (int64, bool) {
 	if len(b.bids) == 0 {
@@ -258,4 +288,44 @@ func (b *Book) Depth() (bids []PriceLevel, asks []PriceLevel) {
 		asks = append(asks, PriceLevel{Price: lv.price, Quantity: lv.totalQty, Orders: len(lv.orders)})
 	}
 	return bids, asks
+}
+
+// LevelState 是一个价格档位的可序列化状态：价位 + 该档挂单的 FIFO 顺序。
+// 委托本体由引擎注册表持有，这里只记录 ID 顺序，供检查点恢复簿子队列。
+type LevelState struct {
+	Side     domain.Side
+	Price    int64
+	OrderIDs []string // 队首最早，FIFO
+}
+
+// ExportLevels 按档位导出簿子结构（买盘降序、卖盘升序，档内 FIFO）。
+func (b *Book) ExportLevels() []LevelState {
+	var out []LevelState
+	for _, lv := range b.bids {
+		out = append(out, exportLevel(domain.SideBuy, lv))
+	}
+	for _, lv := range b.asks {
+		out = append(out, exportLevel(domain.SideSell, lv))
+	}
+	return out
+}
+
+func exportLevel(side domain.Side, lv *level) LevelState {
+	ids := make([]string, len(lv.orders))
+	for i, o := range lv.orders {
+		ids[i] = o.ID
+	}
+	return LevelState{Side: side, Price: lv.price, OrderIDs: ids}
+}
+
+// RestingOrders 返回簿中全部挂单（按档位顺序），供审计与检查点核对明细。
+func (b *Book) RestingOrders() []*domain.Order {
+	var out []*domain.Order
+	for _, lv := range b.bids {
+		out = append(out, lv.orders...)
+	}
+	for _, lv := range b.asks {
+		out = append(out, lv.orders...)
+	}
+	return out
 }

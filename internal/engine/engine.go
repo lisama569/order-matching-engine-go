@@ -10,6 +10,7 @@ package engine
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lisama569/order-matching-engine-go/internal/domain"
 	"github.com/lisama569/order-matching-engine-go/internal/event"
@@ -79,6 +80,8 @@ type Engine struct {
 	books    map[string]*orderbook.Book
 	registry map[string]*domain.Order
 	logf     func(format string, args ...any)
+
+	depth atomic.Value // 最新 *DepthSnapshot：每次状态变更批次提交后在锁内重新发布
 }
 
 // New 创建引擎并登记品种与账户风控配置。
@@ -99,6 +102,7 @@ func New(symbols []string, riskCfg risk.Config, refPrices map[string]int64,
 		e.books[s] = orderbook.New(s)
 	}
 	e.riskMgr = risk.NewManager(riskCfg, refPrices, allowedAccounts, symbolSet(symbols))
+	e.publishDepthLocked()
 	return e
 }
 
@@ -267,6 +271,8 @@ func (e *Engine) Submit(req SubmitRequest) SubmitResult {
 	e.logf("ACCEPT order=%s status=%s fills=%d remaining=%d | 判定依据: 价格优先时间优先预撮合 + 风控通过",
 		order.ID, order.Status, len(fills), remaining)
 
+	e.publishDepthLocked()
+
 	return SubmitResult{
 		Accepted: true,
 		Fills:    fills,
@@ -292,6 +298,7 @@ func (e *Engine) Cancel(req CancelRequest) CancelResult {
 	order.Status = domain.StatusCancelled
 	ev := e.nextEvent(event.Payload{Type: event.TypeOrderCancelled, Order: order})
 	e.mutate(ev)
+	e.publishDepthLocked()
 	return CancelResult{Cancelled: true, OrderID: order.ID}
 }
 
@@ -306,6 +313,8 @@ func (e *Engine) mutate(ev event.Event) {
 			pf := orderbook.ProjectedFill{Maker: maker, Price: f.Price, Quantity: f.Quantity}
 			if closed := bk.ApplyFill(pf, f.Quantity); closed {
 				p.ClosedOrder = cloneOrder(maker)
+				// 挂单方全成移出簿子：释放其挂单笔数占用。
+				e.riskMgr.OnRestingClosed(f.AccountMaker, f.Symbol)
 			}
 		}
 		// 吃单方此刻必然已由受理事件登记（实时）或可在重放时登记（前向兼容）。
@@ -316,11 +325,26 @@ func (e *Engine) mutate(ev event.Event) {
 			e.registry[f.TakerOrderID] = taker
 		}
 		taker.FilledQty += f.Quantity
+		if taker.Remaining() == 0 {
+			taker.Status = domain.StatusFilled
+		} else if taker.FilledQty > 0 {
+			taker.Status = domain.StatusPartiallyFilled
+		}
+		// 限价吃单方受理时已整单入簿：成交同步扣减其所在档位，全成移出；
+		// 挂单名义占用按委托限价记账，释放也用限价（成交价可能更优）。
+		resting, takerClosed := bk.SettleFill(f.TakerOrderID, f.Quantity)
+		if resting {
+			e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, taker.Price, f.Quantity, true)
+			if takerClosed {
+				e.riskMgr.OnRestingClosed(f.AccountTaker, f.Symbol)
+			}
+		} else {
+			e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, f.Price, f.Quantity, false)
+		}
 		opp := domain.SideSell
 		if f.TakerSide == domain.SideSell {
 			opp = domain.SideBuy
 		}
-		e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, f.Price, f.Quantity, false)
 		e.riskMgr.OnFill(f.AccountMaker, f.Symbol, opp, f.Price, f.Quantity, true)
 
 	case event.TypeOrderAccepted:
@@ -392,6 +416,7 @@ func (e *Engine) Replay(events []event.Event) error {
 	e.registry = ghost.registry
 	e.riskMgr = ghost.riskMgr
 	e.store = ghost.store
+	e.publishDepthLocked()
 	return nil
 }
 
