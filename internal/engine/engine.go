@@ -79,6 +79,7 @@ type Engine struct {
 	books    map[string]*orderbook.Book
 	registry map[string]*domain.Order
 	logf     func(format string, args ...any)
+	depth    depthPub // 最近一次发布的盘口一致视图（读路径免锁）
 }
 
 // New 创建引擎并登记品种与账户风控配置。
@@ -99,6 +100,7 @@ func New(symbols []string, riskCfg risk.Config, refPrices map[string]int64,
 		e.books[s] = orderbook.New(s)
 	}
 	e.riskMgr = risk.NewManager(riskCfg, refPrices, allowedAccounts, symbolSet(symbols))
+	e.publishDepth() // 初始空盘口，保证 DepthSnapshot 总有可用视图
 	return e
 }
 
@@ -267,6 +269,8 @@ func (e *Engine) Submit(req SubmitRequest) SubmitResult {
 	e.logf("ACCEPT order=%s status=%s fills=%d remaining=%d | 判定依据: 价格优先时间优先预撮合 + 风控通过",
 		order.ID, order.Status, len(fills), remaining)
 
+	e.depth.dirty.Store(true) // 撮合路径只置脏标记（O(1)），视图重建推迟到读取时
+
 	return SubmitResult{
 		Accepted: true,
 		Fills:    fills,
@@ -292,6 +296,7 @@ func (e *Engine) Cancel(req CancelRequest) CancelResult {
 	order.Status = domain.StatusCancelled
 	ev := e.nextEvent(event.Payload{Type: event.TypeOrderCancelled, Order: order})
 	e.mutate(ev)
+	e.depth.dirty.Store(true)
 	return CancelResult{Cancelled: true, OrderID: order.ID}
 }
 
@@ -306,6 +311,7 @@ func (e *Engine) mutate(ev event.Event) {
 			pf := orderbook.ProjectedFill{Maker: maker, Price: f.Price, Quantity: f.Quantity}
 			if closed := bk.ApplyFill(pf, f.Quantity); closed {
 				p.ClosedOrder = cloneOrder(maker)
+				e.riskMgr.OnRestingClosed(f.AccountMaker, f.Symbol)
 			}
 		}
 		// 吃单方此刻必然已由受理事件登记（实时）或可在重放时登记（前向兼容）。
@@ -315,12 +321,26 @@ func (e *Engine) mutate(ev event.Event) {
 				Symbol: f.Symbol, Side: f.TakerSide, Type: domain.OrderMarket}
 			e.registry[f.TakerOrderID] = taker
 		}
-		taker.FilledQty += f.Quantity
+		if restingTaker, ok := bk.Get(f.TakerOrderID); ok {
+			// 限价吃单方在受理时已挂簿：成交事件同时扣减其档位与成交量，
+			// 全成则移出簿子（簿中绝不残留已完全成交的委托）。
+			if closed := bk.ApplyFill(orderbook.ProjectedFill{Maker: restingTaker, Price: f.Price, Quantity: f.Quantity}, f.Quantity); closed {
+				e.riskMgr.OnRestingClosed(f.AccountTaker, f.Symbol)
+			}
+		} else {
+			taker.FilledQty += f.Quantity
+		}
 		opp := domain.SideSell
 		if f.TakerSide == domain.SideSell {
 			opp = domain.SideBuy
 		}
-		e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, f.Price, f.Quantity, false)
+		// 限价吃单方的挂单名义占用按限价位随成交释放（受理时按限价位全额计入）；
+		// 市价吃单方从未占用，仅更新持仓。
+		if taker.Type == domain.OrderLimit {
+			e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, taker.Price, f.Quantity, true)
+		} else {
+			e.riskMgr.OnFill(f.AccountTaker, f.Symbol, f.TakerSide, f.Price, f.Quantity, false)
+		}
 		e.riskMgr.OnFill(f.AccountMaker, f.Symbol, opp, f.Price, f.Quantity, true)
 
 	case event.TypeOrderAccepted:
@@ -392,6 +412,7 @@ func (e *Engine) Replay(events []event.Event) error {
 	e.registry = ghost.registry
 	e.riskMgr = ghost.riskMgr
 	e.store = ghost.store
+	e.depth.dirty.Store(true)
 	return nil
 }
 

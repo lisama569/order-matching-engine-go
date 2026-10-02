@@ -231,3 +231,18 @@ func (m *Manager) OnCancelled(accountID, symbol string, side domain.Side, price,
 func (m *Manager) State(accountID, symbol string) AccountState {
 	return *m.state(acctKey{accountID, symbol})
 }
+
+// OnRestingClosed 在簿挂单被完全成交移出簿子：挂单笔数 -1。
+// 名义占用已随各笔成交释放，此处只收尾笔数。
+func (m *Manager) OnRestingClosed(accountID, symbol string) {
+	st := m.state(acctKey{accountID, symbol})
+	if st.OpenCount > 0 {
+		st.OpenCount--
+	}
+}
+
+// RestoreState 以检查点中的状态直接覆盖账户-品种风控状态（增量重建用）。
+func (m *Manager) RestoreState(accountID, symbol string, st AccountState) {
+	cp := st
+	m.states[acctKey{accountID, symbol}] = &cp
+}

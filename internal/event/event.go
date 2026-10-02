@@ -63,7 +63,11 @@ func AsSequenceError(err error) (*SequenceError, bool) {
 }
 
 // Store 是线程安全的追加式事件日志，是全部状态变更的权威来源。
+// base 记录已被检查点归档、不再由本日志持有的事件数：
+// 实时撮合与全量重建时 base=0；基于检查点增量重建时 base=检查点序号，
+// 日志只持有检查点之后的事件，内存不随历史事件数增长。
 type Store struct {
+	base   int64
 	events []Event
 }
 
@@ -77,8 +81,8 @@ func NewStore() *Store {
 //   - 小于等于已存在序号 => DUPLICATE；
 //   - 大于期望序号 => GAP。
 func (s *Store) Append(e Event) error {
-	expected := int64(len(s.events)) + 1
-	if e.Seq <= int64(len(s.events)) {
+	expected := s.LastSeq() + 1
+	if e.Seq <= s.LastSeq() {
 		return &SequenceError{Kind: SeqDuplicate, Got: e.Seq, Expected: expected}
 	}
 	if e.Seq > expected {
@@ -88,7 +92,15 @@ func (s *Store) Append(e Event) error {
 	return nil
 }
 
-// All 按序号返回全部事件副本（切片拷贝，避免外部修改）。
+// SetBase 设置已归档事件数（检查点增量重建用）。
+// 设置后本日志只持有 base 之后的事件，序号校验以 base 为起点继续。
+func (s *Store) SetBase(base int64) { s.base = base }
+
+// Base 返回已归档事件数。
+func (s *Store) Base() int64 { return s.base }
+
+// All 按序号返回本日志持有的全部事件副本（切片拷贝，避免外部修改）。
+// 注意：base>0 时只含检查点之后的事件。
 func (s *Store) All() []Event {
 	out := make([]Event, len(s.events))
 	copy(out, s.events)
@@ -96,17 +108,26 @@ func (s *Store) All() []Event {
 }
 
 // From 返回序号 >= fromSeq 的事件副本（订阅者断线追赶用）。
+// fromSeq 落在已归档区间（<= base）时，只能从 base+1 起返回本日志持有的部分。
 func (s *Store) From(fromSeq int64) []Event {
-	if fromSeq < 1 {
-		fromSeq = 1
+	if fromSeq < s.base+1 {
+		fromSeq = s.base + 1
 	}
-	if fromSeq > int64(len(s.events)) {
+	if fromSeq > s.LastSeq() {
 		return nil
 	}
-	out := make([]Event, int64(len(s.events))-fromSeq+1)
-	copy(out, s.events[fromSeq-1:])
+	out := make([]Event, s.LastSeq()-fromSeq+1)
+	copy(out, s.events[fromSeq-s.base-1:])
 	return out
 }
 
-// LastSeq 返回当前最大序号（空日志为 0）。
-func (s *Store) LastSeq() int64 { return int64(len(s.events)) }
+// LastSeq 返回当前最大序号（空日志为 base）。
+func (s *Store) LastSeq() int64 { return s.base + int64(len(s.events)) }
+
+// Last 返回日志持有的最后一个事件；空日志返回 false。
+func (s *Store) Last() (Event, bool) {
+	if len(s.events) == 0 {
+		return Event{}, false
+	}
+	return s.events[len(s.events)-1], true
+}

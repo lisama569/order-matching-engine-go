@@ -77,4 +77,43 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("重放结果与实时状态一致 ✔")
+
+	fmt.Println("== 6) 盘口快照（免锁读取，聚合与明细自洽）==")
+	e.Submit(engine.SubmitRequest{OrderID: "s2", AccountID: "alice", Symbol: "BTCUSD",
+		Side: domain.SideSell, Type: domain.OrderLimit, Price: 105, Quantity: 3})
+	e.Submit(engine.SubmitRequest{OrderID: "b2", AccountID: "bob", Symbol: "BTCUSD",
+		Side: domain.SideBuy, Type: domain.OrderLimit, Price: 95, Quantity: 2})
+	depth := e.DepthSnapshot()
+	for sym, sd := range depth.Symbols {
+		fmt.Printf("   %s bids=%v asks=%v (lastSeq=%d)\n", sym, sd.Bids, sd.Asks, depth.LastSeq)
+	}
+
+	fmt.Println("== 7) 账实一致性审计 ==")
+	rep := e.Audit()
+	fmt.Printf("   OK=%t lastSeq=%d checkedEvents=%d fullCoverage=%t discrepancies=%d\n",
+		rep.OK, rep.LastSeq, rep.CheckedEvents, rep.FullCoverage, len(rep.Discrepancies))
+	if !rep.OK {
+		os.Exit(1)
+	}
+
+	fmt.Println("== 8) 检查点 + 增量重建 ==")
+	events = e.Events().All() // 事件流已推进，重新取全量
+	cp := e.Checkpoint()
+	fmt.Printf("   检查点: seq=%d orders=%d accounts=%d\n", cp.LastSeq, len(cp.Orders), len(cp.Accounts))
+	inc := engine.New([]string{"BTCUSD"}, cfg, map[string]int64{"BTCUSD": 100}, accounts)
+	if err := inc.Rebuild(&cp, events); err != nil {
+		fmt.Printf("增量重建失败: %v\n", err)
+		os.Exit(1)
+	}
+	is := inc.Snapshot()
+	if is.LastSeq != e.Events().LastSeq() {
+		fmt.Println("INCREMENTAL REBUILD MISMATCH")
+		os.Exit(1)
+	}
+	fmt.Printf("   增量重建结果与实时状态一致 ✔ (base=%d，只重放尾部事件)\n", inc.Events().Base())
+	if arep := inc.Audit(); !arep.OK {
+		fmt.Printf("增量重建后审计未通过: %v\n", arep.Discrepancies)
+		os.Exit(1)
+	}
+	fmt.Println("   增量重建引擎审计通过 ✔")
 }

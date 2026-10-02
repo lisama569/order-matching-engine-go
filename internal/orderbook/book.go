@@ -259,3 +259,37 @@ func (b *Book) Depth() (bids []PriceLevel, asks []PriceLevel) {
 	}
 	return bids, asks
 }
+
+// RestingOrder 为档位上一笔未成交挂单的明细。
+type RestingOrder struct {
+	OrderID   string
+	AccountID string
+	Remaining int64
+	Seq       int64 // 受理事件序号（审计定位用）
+}
+
+// LevelDetail 为某价格档位的聚合 + 明细视图。
+type LevelDetail struct {
+	Price    int64
+	Quantity int64          // 该档剩余总量（恒等于 Details 剩余量之和）
+	Orders   []RestingOrder // 按时间优先排列
+}
+
+// DepthDetailed 返回买卖档位的聚合与挂单明细（盘口快照用）。
+func (b *Book) DepthDetailed() (bids []LevelDetail, asks []LevelDetail) {
+	detail := func(lv *level) LevelDetail {
+		d := LevelDetail{Price: lv.price, Quantity: lv.totalQty}
+		for _, o := range lv.orders {
+			d.Orders = append(d.Orders, RestingOrder{
+				OrderID: o.ID, AccountID: o.AccountID, Remaining: o.Remaining(), Seq: o.Sequence})
+		}
+		return d
+	}
+	for _, lv := range b.bids {
+		bids = append(bids, detail(lv))
+	}
+	for _, lv := range b.asks {
+		asks = append(asks, detail(lv))
+	}
+	return bids, asks
+}
