@@ -9,6 +9,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/lisama569/order-matching-engine-go/internal/domain"
@@ -56,6 +57,7 @@ type Snapshot struct {
 	LastSeq  int64
 	Books    map[string]BookView
 	Accounts map[string]risk.AccountState // key: accountID + "/" + symbol
+	Orders   []domain.Order               // 委托登记表（含已终结委托），按 ID 排序，可逐字段比对
 }
 
 // BookView 为单品种视图。
@@ -330,6 +332,14 @@ func (e *Engine) mutate(ev event.Event) {
 		} else {
 			taker.FilledQty += f.Quantity
 		}
+		// 吃单方状态由事件流确定性推导（实时与重放共用本函数，结论必然一致）：
+		// 全成 => FILLED；有成交但有残余 => PARTIALLY_FILLED
+		// （市价单残余随后由撤销事件终结为 CANCELLED；限价残余挂簿等待后续事件）。
+		if taker.Remaining() == 0 {
+			taker.Status = domain.StatusFilled
+		} else if taker.FilledQty > 0 {
+			taker.Status = domain.StatusPartiallyFilled
+		}
 		opp := domain.SideSell
 		if f.TakerSide == domain.SideSell {
 			opp = domain.SideBuy
@@ -435,5 +445,16 @@ func (e *Engine) Snapshot() Snapshot {
 		seen[key] = true
 		snap.Accounts[key] = e.riskMgr.State(o.AccountID, o.Symbol)
 	}
+	snap.Orders = sortedOrders(e.registry)
 	return snap
+}
+
+// sortedOrders 返回委托登记表的确定性排序副本（按 ID），供逐字段比对。
+func sortedOrders(registry map[string]*domain.Order) []domain.Order {
+	out := make([]domain.Order, 0, len(registry))
+	for _, o := range registry {
+		out = append(out, *o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }

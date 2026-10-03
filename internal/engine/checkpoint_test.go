@@ -42,6 +42,9 @@ func TestCheckpointIncrementalRebuildEqualsFull(t *testing.T) {
 	if is.LastSeq != fs.LastSeq {
 		t.Fatalf("LastSeq: incremental=%d full=%d", is.LastSeq, fs.LastSeq)
 	}
+	if msg, ok := ordersEqual(is.Orders, fs.Orders); !ok {
+		t.Fatalf("orders mismatch: %s", msg)
+	}
 	if !booksEqual(is.Books, fs.Books) {
 		t.Fatalf("books mismatch:\ninc=%v\nfull=%v", is.Books, fs.Books)
 	}
@@ -107,6 +110,9 @@ func TestCheckpointFallbackToFullRebuild(t *testing.T) {
 			t.Fatalf("%s: rebuild should fall back to full, got err=%v", tc.name, err)
 		}
 		s := e.Snapshot()
+		if msg, ok := ordersEqual(s.Orders, want.Orders); !ok {
+			t.Fatalf("%s: fallback full rebuild diverges from live: %s", tc.name, msg)
+		}
 		if s.LastSeq != want.LastSeq || !booksEqual(s.Books, want.Books) || !accountsEqual(s.Accounts, want.Accounts) {
 			t.Fatalf("%s: fallback full rebuild diverges from live", tc.name)
 		}

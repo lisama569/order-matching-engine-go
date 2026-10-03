@@ -14,8 +14,11 @@
 - **账实一致性审计**：盘口汇总、账户敞口、事件进度三方对账，
   不一致按类别报告并定位到大致事件序号；
 - **检查点与增量重建**：事件流推进中随时落检查点，之后只重放剩余事件即可
-  补齐状态（与全量重建逐字段一致）；检查点缺失 / 损坏 / 放错位置时
-  安全退回全量重建。老事件流零迁移，仍可全量重放。
+  补齐状态。检查点无论从实时运行中的引擎还是重放引擎落出都完全相同，
+  增量重建结果与从零全量重建、与实时状态**逐字段一致**（每笔委托的
+  最终状态 / 成交量 / 序号、账户敞口、盘口档位），重建后继续下单 / 撤单
+  的行为也与实时一致（已终结委托撤单必拒）；检查点缺失 / 损坏 / 放错位置时
+  安全退回全量重建，退回结果同样与实时一致。老事件流零迁移，仍可全量重放。
 
 详细设计见 [docs/design.md](docs/design.md)。
 
@@ -31,4 +34,8 @@ go run ./cmd/matchingd    # 固定脚本演示：撮合 + 重建 + 盘口快照 
 go test ./internal/engine/ -run 'TestDepthSnapshot' -v   # 盘口快照一致性与并发
 go test ./internal/engine/ -run 'TestAudit' -v           # 审计（含注入不一致）
 go test ./internal/engine/ -run 'TestCheckpoint' -v      # 检查点增量重建与性能
+
+# 复现并验证检查点一致性修复（实时落检查点 vs 全量重建逐字段比对、
+# 并发期间落检查点、重建后行为锁步一致、异常检查点退回）
+go test ./internal/engine/ -run 'TestCheckpointFromLive|TestCheckpointDuring|TestRebuildContinuation|TestCheckpointFallback' -v
 ```
