@@ -161,9 +161,9 @@ func TestCheckpointRebuildFasterThanFull(t *testing.T) {
 	}
 	cp := midEng.Checkpoint()
 
-	// 各测 3 次取最优，降低环境噪声
+	// 各测 5 次取最优，降低环境噪声
 	fullDur := time.Duration(1 << 62)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		start := time.Now()
 		full := newEng()
 		if err := full.Replay(events); err != nil {
@@ -175,7 +175,7 @@ func TestCheckpointRebuildFasterThanFull(t *testing.T) {
 	}
 	var inc *Engine
 	incDur := time.Duration(1 << 62)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		start := time.Now()
 		inc = newEng()
 		if err := inc.Rebuild(&cp, events); err != nil {

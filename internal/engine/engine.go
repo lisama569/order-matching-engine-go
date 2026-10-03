@@ -312,6 +312,10 @@ func (e *Engine) mutate(ev event.Event) {
 			if closed := bk.ApplyFill(pf, f.Quantity); closed {
 				p.ClosedOrder = cloneOrder(maker)
 				e.riskMgr.OnRestingClosed(f.AccountMaker, f.Symbol)
+			} else if maker.Remaining() > 0 {
+				// 挂单方部分成交：状态必须由统一转移函数推进，
+				// 实时路径与事件重放路径才会逐字段一致（§1：残余挂单状态为 PARTIALLY_FILLED）。
+				maker.Status = domain.StatusPartiallyFilled
 			}
 		}
 		// 吃单方此刻必然已由受理事件登记（实时）或可在重放时登记（前向兼容）。
@@ -326,9 +330,17 @@ func (e *Engine) mutate(ev event.Event) {
 			// 全成则移出簿子（簿中绝不残留已完全成交的委托）。
 			if closed := bk.ApplyFill(orderbook.ProjectedFill{Maker: restingTaker, Price: f.Price, Quantity: f.Quantity}, f.Quantity); closed {
 				e.riskMgr.OnRestingClosed(f.AccountTaker, f.Symbol)
+			} else if restingTaker.Remaining() > 0 {
+				restingTaker.Status = domain.StatusPartiallyFilled
 			}
 		} else {
 			taker.FilledQty += f.Quantity
+			// 市价吃单方（不在簿中）：全成即 FILLED；有残余时保持 NEW，
+			// 残余由后续 ORDER_CANCELLED 事件终结。状态在 mutate 内推进，
+			// 保证“实时落检查点 + 尾部重放”与“从零全量重放”得到同一结果。
+			if taker.Remaining() == 0 {
+				taker.Status = domain.StatusFilled
+			}
 		}
 		opp := domain.SideSell
 		if f.TakerSide == domain.SideSell {

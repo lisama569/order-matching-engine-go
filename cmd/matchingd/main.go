@@ -96,24 +96,47 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("== 8) 检查点 + 增量重建 ==")
+	fmt.Println("== 8) 检查点 + 增量重建（从实时引擎落盘，三方逐字段比对）==")
 	events = e.Events().All() // 事件流已推进，重新取全量
 	cp := e.Checkpoint()
-	fmt.Printf("   检查点: seq=%d orders=%d accounts=%d\n", cp.LastSeq, len(cp.Orders), len(cp.Accounts))
+	fmt.Printf("   检查点(实时落盘): seq=%d orders=%d accounts=%d\n", cp.LastSeq, len(cp.Orders), len(cp.Accounts))
 	inc := engine.New([]string{"BTCUSD"}, cfg, map[string]int64{"BTCUSD": 100}, accounts)
 	if err := inc.Rebuild(&cp, events); err != nil {
 		fmt.Printf("增量重建失败: %v\n", err)
 		os.Exit(1)
 	}
-	is := inc.Snapshot()
-	if is.LastSeq != e.Events().LastSeq() {
-		fmt.Println("INCREMENTAL REBUILD MISMATCH")
+	// 对照：从零全量重建
+	fullEng := engine.New([]string{"BTCUSD"}, cfg, map[string]int64{"BTCUSD": 100}, accounts)
+	if err := fullEng.Replay(events); err != nil {
+		fmt.Printf("全量重建失败: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("   增量重建结果与实时状态一致 ✔ (base=%d，只重放尾部事件)\n", inc.Events().Base())
+	if !engine.StatesEqual(e, inc) || !engine.StatesEqual(inc, fullEng) {
+		fmt.Println("INCREMENTAL REBUILD MISMATCH: 实时/增量/全量三者逐字段不一致")
+		os.Exit(1)
+	}
+	fmt.Printf("   实时 = 增量重建 = 全量重建（每笔委托状态/成交量/序号、盘口档位、账户敞口逐字段一致） ✔\n")
+	fmt.Printf("   增量日志只持尾部: base=%d tail=%d（全量为 base=0 all=%d）\n",
+		inc.Events().Base(), len(inc.Events().All()), len(events))
 	if arep := inc.Audit(); !arep.OK {
 		fmt.Printf("增量重建后审计未通过: %v\n", arep.Discrepancies)
 		os.Exit(1)
 	}
 	fmt.Println("   增量重建引擎审计通过 ✔")
+
+	fmt.Println("== 9) 损坏检查点安全退回全量重建 ==")
+	bad := cp
+	if len(bad.Orders) > 0 {
+		bad.Orders[0].FilledQty += 1 // 篡改但不重算校验值 => 校验值不匹配
+	}
+	fb := engine.New([]string{"BTCUSD"}, cfg, map[string]int64{"BTCUSD": 100}, accounts)
+	if err := fb.Rebuild(&bad, events); err != nil {
+		fmt.Printf("损坏检查点退回后不应报错: %v\n", err)
+		os.Exit(1)
+	}
+	if fb.Events().Base() != 0 || !engine.StatesEqual(fb, e) {
+		fmt.Println("FALLBACK MISMATCH: 损坏检查点退回全量后的结果与实时不一致")
+		os.Exit(1)
+	}
+	fmt.Println("   损坏检查点被识别 => 安全退回从序号1全量重建，结果与实时逐字段一致 ✔")
 }

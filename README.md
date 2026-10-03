@@ -14,8 +14,12 @@
 - **账实一致性审计**：盘口汇总、账户敞口、事件进度三方对账，
   不一致按类别报告并定位到大致事件序号；
 - **检查点与增量重建**：事件流推进中随时落检查点，之后只重放剩余事件即可
-  补齐状态（与全量重建逐字段一致）；检查点缺失 / 损坏 / 放错位置时
-  安全退回全量重建。老事件流零迁移，仍可全量重放。
+  补齐状态。检查点**无论从正在运行的实时引擎落、还是从重放中间态落**，
+  增量重建结果都与从零全量重建、与实时状态**逐字段一致**（每笔委托的最终状态 /
+  成交量 / 受理序号、盘口档位、账户敞口）；并发下单 / 撤单期间落检查点同样成立。
+  检查点缺失 / 损坏（校验值不匹配）/ LastSeq 矛盾 / 事件指纹对不上（放错位置）/
+  尾部序号链对不上时，一律识别并安全退回全量重建，绝不顺着错误起点继续；
+  若事件流本身畸形，全量重放明确报错且线上状态保持不变。老事件流零迁移。
 
 详细设计见 [docs/design.md](docs/design.md)。
 
@@ -31,4 +35,10 @@ go run ./cmd/matchingd    # 固定脚本演示：撮合 + 重建 + 盘口快照 
 go test ./internal/engine/ -run 'TestDepthSnapshot' -v   # 盘口快照一致性与并发
 go test ./internal/engine/ -run 'TestAudit' -v           # 审计（含注入不一致）
 go test ./internal/engine/ -run 'TestCheckpoint' -v      # 检查点增量重建与性能
+
+# 检查点一致性（bugfix-b）：实时落检查点增量重建 == 从零全量重建 == 实时，逐字段
+go test ./internal/engine/ -run 'TestLiveCheckpointIncrementalEqualsFull|TestMixedScenarioFinalOrderStates' -v
+go test ./internal/engine/ -run 'TestPostRebuildBehaviorMatchesLive' -v          # 重建后续行为一致
+go test ./internal/engine/ -run 'TestConcurrentCheckpointRebuild' -race -v       # 并发期间落检查点
+go test ./internal/engine/ -run 'TestCheckpointFallback|TestRebuildMalformed|TestCheckpointTailBroken' -v
 ```

@@ -14,6 +14,9 @@
   - 市价单（`OrderMarket`）按 IOC 语义：能吃多少吃多少，**残余立即撤销**，绝不挂簿；
     若对手盘为空、一口都吃不到，则以 `NO_LIQUIDITY` 拒绝。
   - 限价单残余（且仍可挂单）留在簿中，状态为 `NEW`（零成交）或 `PARTIALLY_FILLED`。
+    `PARTIALLY_FILLED` 由统一状态转移函数 `mutate` 在每笔成交后即时推进
+    （挂单方、限价吃单方、市价吃单方的全部终结状态都在 mutate 内推导，
+    实时撮合与事件重放逐字段一致，见 §3.3）。
 - 数量与价格校验（拒绝原因可区分，见 §4）：
   - 数量必须为正整数，否则 `INVALID_QUANTITY`；
   - 限价单价格必须为正且不超过 `risk.Config.MaxPrice`，否则 `INVALID_PRICE`；
@@ -115,24 +118,53 @@ ORDER_ACCEPTED(taker, 原始委托)
 
 ## 3.3 检查点与增量重建
 
-`Engine.Checkpoint()` 在事件流推进过程中随时落检查点：`LastSeq`、
-序号 `LastSeq` 处事件的内容指纹、委托登记表、账户风控状态，
+`Engine.Checkpoint()` 在事件流推进过程中随时落检查点（与撮合共用同一把互斥锁，
+因此**并发下单 / 撤单期间落盘也只会观察到完整变更批次之后的状态**）：`LastSeq`、
+序号 `LastSeq` 处事件的内容指纹、委托登记表（含已终结委托）、账户风控状态，
 以及覆盖全部字段的 FNV-1a 校验值。盘口不单独落盘——在簿挂单按受理序号
-重挂即可恢复价格-时间优先队列。
+（`Sequence`）排序重挂即可恢复价格-时间优先队列。
 
-`Engine.Rebuild(cp, events)` 基于检查点增量重建：
+**一致性保证（实时落盘与重放落盘等价）。** 检查点无论来自正在运行的实时引擎，
+还是来自重放前缀得到的中间引擎，`Rebuild` 的结果都与从零全量重建、与实时状态
+**逐字段一致**：每笔委托的最终状态（`NEW/PARTIALLY_FILLED/FILLED/CANCELLED`）、
+`FilledQty`、受理序号 `Sequence`，盘口各档价位 / 剩余总量 / 笔数，
+以及全部账户-品种的净持仓与买 / 卖挂单名义占用、挂单笔数。
+
+成立的根本原因是：委托状态的全部派生都在**唯一状态转移函数** `Engine.mutate(ev)`
+内完成，实时撮合、全量重放、检查点后尾部重放走同一份代码——
+
+- `ORDER_FILLED`：挂单方（含限价吃单方）部分成交即置 `PARTIALLY_FILLED`、
+  全成置 `FILLED` 并移出簿子；**市价吃单方（不在簿中）全成即 `FILLED`，
+  有残余时保持 `NEW` 由后续 `ORDER_CANCELLED` 终结**。
+  此前市价吃单方的终结状态只在 `Submit` 尾部补写、`mutate` 不推进，
+  导致“实时落检查点 + 尾部重放”保留 `FILLED/CANCELLED`，而从零全量重放停在
+  `NEW`——这正是本次修复的分歧根因，修复后成交状态对三条路径完全一致。
+- `ORDER_CANCELLED`：在簿则移除并释放挂单占用（市价残余不在簿、不重复释放），
+  状态置 `CANCELLED`。已 `FILLED/CANCELLED` 的委托在受理撤单时即被拒绝，
+  重建后该判定行为不变（检查点保留全部已终结委托）。
+
+`Engine.Rebuild(cp, events)` 基于检查点增量重建，按以下顺序决策：
 
 - `cp == nil`（缺失）：直接从序号 1 全量重建；
-- 校验值不匹配（损坏）、`LastSeq` 超出事件流或与事件流不衔接、
-  事件指纹对不上（放错位置）：记录原因并**安全退回全量重建**，
-  绝不顺着错误的起点悄悄往下走；
+- 校验值不匹配（内容损坏）、`LastSeq` 为负或“为 0 却携带状态”、
+  `LastSeq` 超出事件流、边界事件序号不是 `LastSeq` 或**事件内容指纹对不上**
+  （放错位置 / 属于另一条事件流）：记录原因并**安全退回全量重建**；
+- 检查点定位合法但**尾部事件序号链**存在缺口 / 重复 / 乱序：不顺着检查点继续，
+  同样**先安全退回全量重建**；全量重放因此也失败时，明确返回
+  `*event.SequenceError` 且**不替换线上状态**（重建在影子引擎上完成，
+  成功后才提交），绝不产出“从错误起点悄悄重建”的状态；
 - 检查点合法：恢复状态后从 `LastSeq+1` 起按序重放剩余事件，
-  序号连续性判定规则不变；补齐结果与从零完整重建**逐字段一致**
-  （`TestCheckpointIncrementalRebuildEqualsFull`）。
+  序号连续性判定规则不变；补齐结果与从零完整重建**逐字段一致**。
+
+重建后的引擎可用同一把锁继续撮合：新事件序号从尾部 `LastSeq` 严格衔接，
+继续下单 / 撤单 / 重复撤单 / 撤已终结单的结论与“实时引擎提交相同序列”完全一致。
 
 与 `Replay` 相同，重建先在影子引擎上完成，成功后才替换线上状态。
 大事件量下（4.5 万事件、100 档价位）带检查点的重建耗时约为全量重建的
 1/2.2 且日志只保留尾部事件（`TestCheckpointRebuildFasterThanFull`）。
+
+`engine.StatesEqual(a, b)` 与 `Engine.Orders()` 提供两台引擎完整派生状态
+（LastSeq、逐笔委托字段、盘口、账户敞口）的逐字段比对，供校验与演示复用。
 
 ## 4. 风控配置项与拒绝原因
 
@@ -191,6 +223,16 @@ go test -race -count=1 ./...
 
 # 确定性演示：下单/部分成交/风控拒绝/撤单 + 事件流重建比对
 go run ./cmd/matchingd
+
+# 检查点一致性复现（bugfix-b）
+# 1. 实时引擎在混合流每个批次边界落检查点，增量重建 == 全量重建 == 实时（逐字段）
+go test ./internal/engine/ -run 'TestLiveCheckpointIncrementalEqualsFull|TestMixedScenarioFinalOrderStates' -v
+# 2. 重建后继续下单/撤单/重复撤单结论与实时一致
+go test ./internal/engine/ -run TestPostRebuildBehaviorMatchesLive -v
+# 3. 并发下单/撤单期间落检查点（建议带 -race）
+go test ./internal/engine/ -run TestConcurrentCheckpointRebuild -race -v
+# 4. 检查点缺失/损坏/放错位置/尾部序号畸形的安全退回
+go test ./internal/engine/ -run 'TestCheckpointFallback|TestRebuildMalformed|TestCheckpointTailBroken' -v
 ```
 
 关键测试：
@@ -206,6 +248,20 @@ go run ./cmd/matchingd
 - `internal/engine.TestCheckpoint*`：检查点增量重建与全量重建逐字段一致；
   缺失 / 损坏 / 放错位置的检查点安全退回全量重建；4.5 万事件下增量重建
   明显快于全量重建且日志只保留尾部事件；
+- `internal/engine.TestLiveCheckpointIncrementalEqualsFull`：检查点**直接从实时
+  运行中的引擎**在每个批次边界落盘，增量重建与从零全量重建、实时状态逐字段一致
+  （市价全成 / 市价残余撤销 / 限价部分成交继续挂簿 / 主动撤单 / 重复撤单 /
+  撤已成交单 / 参数与风控拒绝 / 重复 ID 混合流）；
+- `internal/engine.TestMixedScenarioFinalOrderStates`：混合流逐笔最终状态 /
+  成交量 / 受理序号符合业务语义，且多个实时检查点的增量重建都等于实时与全量；
+- `internal/engine.TestPostRebuildBehaviorMatchesLive`：重建后继续下单 / 撤单 /
+  重复撤单 / 撤已终结单的结论与实时完全相同；
+- `internal/engine.TestConcurrentCheckpointRebuild`：并发下单 / 撤单期间持续落
+  检查点（`-race`），每个检查点的增量重建终态都与实时 / 全量逐字段一致；
+- `internal/engine.TestCheckpointFallback*` / `TestRebuildMalformed*` /
+  `TestCheckpointTailBroken*`：检查点缺失、内容损坏、LastSeq 矛盾、指纹对不上、
+  尾部序号链缺口 / 重复 / 乱序全部安全退回全量；事件流本身畸形时明确报错且
+  线上状态保持不变；
 - `internal/engine.TestAudit*`：健康引擎审计通过；人为注入账户敞口 /
   盘口明细不一致时审计判不通过，并给出差异类别与大致事件序号。
 
@@ -216,7 +272,17 @@ go run ./cmd/matchingd
   `Replay(events)` 等价。
 - **检查点可选**：不落检查点不影响任何既有路径；检查点不可用时自动
   退回全量重建，结果与不用检查点完全一致。
-- **行为修正**：本版修正了限价吃单方全成后仍残留簿中、其挂单名义占用
+- **行为修正（检查点一致性）**：本版修正“成交委托的终结状态只由实时路径
+  `Submit` 尾部补写、统一转移函数 `mutate` 不推进”的疏漏。此前市价吃单方
+  全成 / 残余撤销、以及部分成交挂单方的状态，在“从零全量重放”与
+  “实时落检查点 + 尾部重放”两条路径上会给出不同结果（重放走完全部成交后
+  市价单仍停在 `NEW`）。现全部收归 `mutate` 在成交 / 撤单事件内即时推导，
+  实时、全量重放、任意检查点增量重建三条路径逐字段一致。
+- **行为修正（异常检查点退回）**：`LastSeq=0` 却携带状态的矛盾检查点，以及
+  定位合法但尾部事件序号链缺口 / 重复 / 乱序的情形，现在都会被识别并安全
+  退回全量重建；全量重放也无法成功时明确报错、不替换线上状态，绝不从错误
+  起点悄悄往下重建。
+- **行为修正**：更早版本曾修正限价吃单方全成后仍残留簿中、其挂单名义占用
   与挂单笔数未随成交释放的记账疏漏（实现与 §1 文档原意对齐）。
   下单 / 撤单 / 重放 / 风控的受理与拒绝结论不变；仅派生视图
   （盘口档位、账户挂单占用）不再包含本应离场的残留项。

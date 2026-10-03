@@ -117,6 +117,12 @@ func (cp *Checkpoint) validate(events []event.Event) error {
 	if cp.LastSeq < 0 {
 		return fmt.Errorf("检查点损坏: LastSeq=%d 为负", cp.LastSeq)
 	}
+	// LastSeq=0 合法的唯一形态是空检查点（事件流也为空）；
+	// 携带状态却声称位于起点的检查点必然是损坏/放错，按全量重放会与状态重复。
+	if cp.LastSeq == 0 && (len(cp.Orders) > 0 || len(cp.Accounts) > 0) {
+		return fmt.Errorf("检查点放错位置: LastSeq=0 却携带 orders=%d accounts=%d 状态",
+			len(cp.Orders), len(cp.Accounts))
+	}
 	if cp.LastSeq > int64(len(events)) {
 		return fmt.Errorf("检查点放错位置: LastSeq=%d 超出事件流长度 %d", cp.LastSeq, len(events))
 	}
@@ -181,6 +187,10 @@ func (e *Engine) Rebuild(cp *Checkpoint, events []event.Event) error {
 	if cp != nil {
 		if err := cp.validate(events); err != nil {
 			e.logf("CHECKPOINT 不可用: %v | 判定依据: 安全退回全量重建(从序号 1 开始)", err)
+		} else if err := verifySequence(events[int(cp.LastSeq):], cp.LastSeq+1); err != nil {
+			// 定位校验通过（指纹能对上），但尾部事件自身的序号链缺口/重复/乱序：
+			// 同样不顺着检查点往下走，安全退回全量重建。
+			e.logf("CHECKPOINT 尾部序号对不上: %v | 判定依据: 安全退回全量重建(从序号 1 开始)", err)
 		} else {
 			e.restore(ghost, cp)
 			start = int(cp.LastSeq)
@@ -198,6 +208,10 @@ func (e *Engine) Rebuild(cp *Checkpoint, events []event.Event) error {
 		return nil
 	})
 	if err != nil {
+		// 退回全量后仍失败：事件流本身畸形（缺口/重复/乱序），保持线上状态不变并明确报错。
+		if start != 0 {
+			return fmt.Errorf("incremental rebuild from checkpoint: %w", err)
+		}
 		return err
 	}
 
@@ -207,6 +221,11 @@ func (e *Engine) Rebuild(cp *Checkpoint, events []event.Event) error {
 	e.store = ghost.store
 	e.depth.dirty.Store(true)
 	return nil
+}
+
+// verifySequence 只校验事件序号链是否严格从 startSeq 连续（不应用状态）。
+func verifySequence(events []event.Event, startSeq int64) error {
+	return event.ReplayFrom(events, startSeq, func(event.Event) error { return nil })
 }
 
 // hashEvent 计算事件内容指纹（检查点定位用）：覆盖序号、类型与全部负载字段。
